@@ -34,6 +34,7 @@ import { createPortal } from "react-dom";
 import { useNavigate } from "react-router-dom";
 
 import { Markdown } from "@/components/Markdown";
+import { fetchJSON } from "@/lib/api";
 import { GatewayClient } from "@/lib/gatewayClient";
 import { extractSpeakable, sanitizeForSpeech } from "@/lib/jarvis-speech";
 import { cn } from "@/lib/utils";
@@ -277,9 +278,19 @@ export default function JarvisPage() {
 
   // Unspoken tail of the streaming assistant message.
   const speechBufRef = useRef("");
-  // Utterances waiting on speechSynthesis (it queues internally; we track
-  // count to know when speech is done).
-  const pendingUtterancesRef = useRef(0);
+  // Server-TTS pipeline: coalesced text chunks awaiting synthesis, the
+  // audio element currently playing, a prefetch slot for the next chunk,
+  // and a generation counter that cancels the pump loop on interrupt.
+  const chunkBufRef = useRef("");
+  const queueRef = useRef<string[]>([]);
+  const playingRef = useRef(false);
+  const audioElRef = useRef<HTMLAudioElement | null>(null);
+  const genRef = useRef(0);
+  const serverTtsDownRef = useRef(false);
+  const prefetchRef = useRef<{
+    text: string;
+    promise: Promise<string | null>;
+  } | null>(null);
   const voiceRef = useRef<SpeechSynthesisVoice | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement | null>(null);
 
@@ -309,43 +320,145 @@ export default function JarvisPage() {
       window.speechSynthesis.removeEventListener("voiceschanged", pick);
   }, []);
 
-  const settleAfterSpeech = useCallback(() => {
-    if (pendingUtterancesRef.current > 0) return;
-    setStatus((s) => (s === "speaking" ? "available" : s));
-  }, []);
+  /**
+   * Ask the dashboard server to synthesize with the configured TTS provider
+   * (ElevenLabs / Edge / OpenAI — ``tts.`` in config.yaml). Returns a data:
+   * URL, or null so the caller falls back to the browser's built-in voice.
+   */
+  const synthesizeServer = useCallback(
+    async (text: string): Promise<string | null> => {
+      if (serverTtsDownRef.current) return null;
+      try {
+        const res = await fetchJSON<{ data_url?: string }>(
+          "/api/audio/speak",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text }),
+          },
+        );
+        return res?.data_url || null;
+      } catch {
+        serverTtsDownRef.current = true;
+        return null;
+      }
+    },
+    [],
+  );
 
-  const enqueueSpeech = useCallback(
-    (sentences: string[]) => {
-      if (!ttsRef.current || !("speechSynthesis" in window)) return;
-      for (const sentence of sentences) {
-        if (!sentence) continue;
-        const u = new SpeechSynthesisUtterance(sentence);
+  const speakWithBrowser = useCallback(
+    (text: string, gen: number) =>
+      new Promise<void>((resolve) => {
+        if (!("speechSynthesis" in window)) {
+          resolve();
+          return;
+        }
+        const u = new SpeechSynthesisUtterance(text);
         if (voiceRef.current) u.voice = voiceRef.current;
         u.rate = 1.04;
         u.pitch = 0.95;
-        pendingUtterancesRef.current += 1;
-        u.onstart = () => {
-          if (statusRef.current !== "listening") setStatus("speaking");
-        };
-        u.onend = () => {
-          pendingUtterancesRef.current -= 1;
-          settleAfterSpeech();
-        };
-        u.onerror = () => {
-          pendingUtterancesRef.current -= 1;
-          settleAfterSpeech();
-        };
+        u.onend = () => resolve();
+        u.onerror = () => resolve();
         window.speechSynthesis.speak(u);
+        // A cancel()ed utterance never fires onend in some browsers — poll
+        // so an interrupt can't wedge the pump loop.
+        const guard = setInterval(() => {
+          if (gen !== genRef.current || !window.speechSynthesis.speaking) {
+            clearInterval(guard);
+            resolve();
+          }
+        }, 250);
+      }),
+    [],
+  );
+
+  /** Sequentially synthesize + play queued chunks, prefetching the next
+   *  chunk's audio while the current one plays. */
+  const pumpSpeech = useCallback(async () => {
+    if (playingRef.current) return;
+    playingRef.current = true;
+    const gen = genRef.current;
+    while (queueRef.current.length > 0 && gen === genRef.current) {
+      const text = queueRef.current.shift();
+      if (!text) continue;
+      if (statusRef.current !== "listening") setStatus("speaking");
+      const current =
+        prefetchRef.current?.text === text
+          ? prefetchRef.current.promise
+          : synthesizeServer(text);
+      const next = queueRef.current[0];
+      prefetchRef.current = next
+        ? { text: next, promise: synthesizeServer(next) }
+        : null;
+      const dataUrl = await current;
+      if (gen !== genRef.current) break;
+      if (dataUrl) {
+        await new Promise<void>((resolve) => {
+          const audio = new Audio(dataUrl);
+          audioElRef.current = audio;
+          audio.onended = () => resolve();
+          audio.onerror = () => resolve();
+          audio.play().catch(() => resolve());
+        });
+      } else {
+        await speakWithBrowser(text, gen);
+      }
+    }
+    playingRef.current = false;
+    if (gen === genRef.current) {
+      setStatus((s) => (s === "speaking" ? "available" : s));
+    }
+  }, [speakWithBrowser, synthesizeServer]);
+
+  const flushSpeechChunks = useCallback(() => {
+    if (chunkBufRef.current) {
+      queueRef.current.push(chunkBufRef.current);
+      chunkBufRef.current = "";
+    }
+    void pumpSpeech();
+  }, [pumpSpeech]);
+
+  // Coalesce sentences into ~140-char chunks: the first flushes immediately
+  // so speech starts fast; later ones batch to keep TTS requests (and
+  // ElevenLabs cost) reasonable.
+  const enqueueSpeech = useCallback(
+    (sentences: string[]) => {
+      if (!ttsRef.current) return;
+      for (const s of sentences) {
+        if (!s) continue;
+        chunkBufRef.current = chunkBufRef.current
+          ? `${chunkBufRef.current} ${s}`
+          : s;
+        const idle = !playingRef.current && queueRef.current.length === 0;
+        if (idle || chunkBufRef.current.length >= 140) flushSpeechChunks();
       }
     },
-    [settleAfterSpeech],
+    [flushSpeechChunks],
   );
 
   const stopSpeaking = useCallback(() => {
+    genRef.current += 1;
     speechBufRef.current = "";
-    pendingUtterancesRef.current = 0;
+    chunkBufRef.current = "";
+    queueRef.current = [];
+    prefetchRef.current = null;
+    const audio = audioElRef.current;
+    if (audio) {
+      try {
+        audio.pause();
+      } catch {
+        /* already stopped */
+      }
+      audioElRef.current = null;
+    }
     if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+    playingRef.current = false;
+    setStatus((s) => (s === "speaking" ? "available" : s));
   }, []);
+
+  useEffect(() => {
+    if (!ttsEnabled) stopSpeaking();
+  }, [ttsEnabled, stopSpeaking]);
 
   /* gateway lifecycle */
   useEffect(() => {
@@ -397,12 +510,17 @@ export default function JarvisPage() {
         const tail = speechBufRef.current;
         speechBufRef.current = "";
         const toSpeak = sanitizeForSpeech(tail);
-        const hadStream = tail.length > 0 || pendingUtterancesRef.current > 0;
+        const hadStream =
+          tail.length > 0 ||
+          playingRef.current ||
+          queueRef.current.length > 0 ||
+          chunkBufRef.current.length > 0;
         if (toSpeak) enqueueSpeech([toSpeak]);
         else if (!hadStream && finalText)
           enqueueSpeech([sanitizeForSpeech(finalText)]);
+        flushSpeechChunks();
         setStatus(() =>
-          pendingUtterancesRef.current > 0 || window.speechSynthesis?.speaking
+          playingRef.current || queueRef.current.length > 0
             ? "speaking"
             : "available",
         );
@@ -444,11 +562,11 @@ export default function JarvisPage() {
       }
       gw.close();
       gwRef.current = null;
-      if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+      stopSpeaking();
       recognitionRef.current?.abort();
     };
-    // enqueueSpeech is stable (useCallback([])-equivalent deps).
-  }, [enqueueSpeech]);
+    // All three deps are stable useCallbacks — this effect runs once.
+  }, [enqueueSpeech, flushSpeechChunks, stopSpeaking]);
 
   /* sending */
   const send = useCallback(
